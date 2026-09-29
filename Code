@@ -1,0 +1,287 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// Tenga pini za I2C na SH1106 OLED
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+#define BUTTON_PIN   4
+#define OLED_SDA     21
+#define OLED_SCL     22
+
+struct Location {
+  const char* name;
+  const char* code;
+  float lat;
+  float lon;
+  const char* tz;
+};
+
+Location locations[3] = {
+  {"Tanzania", "TZ", -6.0,  35.0, "Africa/Dar_es_Salaam"},
+  {"Kenya",    "KE",  1.0,  38.0, "Africa/Nairobi"},
+  {"Uganda",   "UG",  1.25, 32.5, "Africa/Kampala"}
+};
+
+struct WeatherData {
+  float temperature = 0;
+  float humidity    = 0;
+  float rain        = 0;
+  float windSpeed   = 0;
+  int   weatherCode = -1;
+  bool  isDay       = true;
+  bool  valid       = false;
+};
+
+WeatherData weather[3];
+int currentCountry = 0;
+
+unsigned long lastFetch  = 0;
+unsigned long lastButton = 0;
+const unsigned long FETCH_INTERVAL = 600000UL; // Dakika 10
+const unsigned long DEBOUNCE       = 300UL;
+
+String getCondition(int code) {
+  if (code == 0)                return "Clear";
+  if (code >= 1  && code <= 3)  return "Cloudy";
+  if (code == 45 || code == 48) return "Fog";
+  if (code >= 51 && code <= 57) return "Drizzle";
+  if (code >= 61 && code <= 67) return "Rain";
+  if (code >= 71 && code <= 77) return "Snow";
+  if (code >= 80 && code <= 82) return "Showers";
+  if (code >= 95 && code <= 99) return "Thunder";
+  return "Unknown";
+}
+
+void showSplash() {
+  u8g2.clearBuffer();
+
+  u8g2.setFont(u8g2_font_logisoso16_tf);
+  const char* title = "LumiWeather";
+  int w = u8g2.getStrWidth(title);
+  u8g2.drawStr((128 - w) / 2, 24, title);
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  const char* sub = "Multi-Country Weather";
+  int w2 = u8g2.getStrWidth(sub);
+  u8g2.drawStr((128 - w2) / 2, 42, sub);
+
+  u8g2.setFont(u8g2_font_5x8_tf);
+  const char* load = "Connecting WiFi...";
+  int w3 = u8g2.getStrWidth(load);
+  u8g2.drawStr((128 - w3) / 2, 58, load);
+
+  u8g2.sendBuffer();
+}
+
+void drawWeather(int idx) {
+  WeatherData& w = weather[idx];
+  Location&   L = locations[idx];
+
+  u8g2.clearBuffer();
+
+  // Mstari wa Kwanza: Jina la Nchi & Hali ya Hewa
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(0, 11, L.name);
+
+  String cond = getCondition(w.weatherCode);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  int cw = u8g2.getStrWidth(cond.c_str());
+  u8g2.drawStr(128 - cw, 11, cond.c_str());
+
+  u8g2.drawLine(0, 14, 128, 14);
+
+  if (!w.valid) {
+    u8g2.setFont(u8g2_font_7x13B_tf);
+    u8g2.drawStr(15, 38, "No data yet...");
+    u8g2.setFont(u8g2_font_5x8_tf);
+    u8g2.drawStr(25, 54, "Check WiFi Connection");
+    u8g2.sendBuffer();
+    return;
+  }
+
+  // Mstari wa Pili: Joto (Temperature) & Unyevunyevu (Humidity)
+  u8g2.setFont(u8g2_font_logisoso16_tf);
+  char tempBuf[12];
+  sprintf(tempBuf, "%.1f", w.temperature);
+  u8g2.drawStr(0, 36, tempBuf);
+
+  // Kuweka Alama ya Digrii °C
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  int tw = u8g2.getStrWidth(tempBuf);
+  u8g2.drawStr(tw + 2, 36, "\xB0 C");
+
+  char humBuf[12];
+  sprintf(humBuf, "%02.0f%%", w.humidity);
+  int hw = u8g2.getStrWidth(humBuf);
+  u8g2.drawStr(128 - hw, 36, humBuf);
+
+  // Mstari wa Tatu: Mvua (Rain), Upepo (Wind) na Siku/Usiku
+  u8g2.setFont(u8g2_font_5x8_tf);
+
+  char rainBuf[24];
+  sprintf(rainBuf, "Rain:%.1fmm", w.rain);
+  u8g2.drawStr(0, 48, rainBuf);
+
+  char windBuf[24];
+  sprintf(windBuf, "Wind:%.0fkm/h", w.windSpeed);
+  u8g2.drawStr(0, 59, windBuf);
+
+  const char* dn = w.isDay ? "DAY" : "NIGHT";
+  u8g2.setFont(u8g2_font_6x10_tf);
+  int dw = u8g2.getStrWidth(dn);
+  u8g2.drawStr(128 - dw, 59, dn);
+
+  u8g2.sendBuffer();
+}
+
+bool fetchWeather(int idx) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  Location& L = locations[idx];
+
+  String url = "http://api.open-meteo.com/v1/forecast?latitude=";
+  url += String(L.lat, 4);
+  url += "&longitude=";
+  url += String(L.lon, 4);
+  url += "&current=temperature_2m,relative_humidity_2m,rain,"
+         "wind_speed_10m,weather_code,is_day";
+  url += "&timezone=";
+  url += L.tz;
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(8000);
+  int code = http.GET();
+
+  if (code != 200) {
+    Serial.printf("[%s] HTTP error: %d\n", L.name, code);
+    http.end();
+    return false;
+  }
+
+  // Json Filter kwa ajili ya kuokoa Memory
+  StaticJsonDocument<256> filter;
+  filter["current"]["temperature_2m"]       = true;
+  filter["current"]["relative_humidity_2m"] = true;
+  filter["current"]["rain"]                 = true;
+  filter["current"]["wind_speed_10m"]       = true;
+  filter["current"]["weather_code"]         = true;
+  filter["current"]["is_day"]               = true;
+
+  DynamicJsonDocument doc(1536);
+  DeserializationError err = deserializeJson(
+      doc, http.getString(), DeserializationOption::Filter(filter));
+  http.end();
+
+  if (err) {
+    Serial.printf("[%s] JSON err: %s\n", L.name, err.c_str());
+    return false;
+  }
+
+  JsonObject cur = doc["current"];
+  weather[idx].temperature = cur["temperature_2m"];
+  weather[idx].humidity    = cur["relative_humidity_2m"];
+  weather[idx].rain        = cur["rain"];
+  weather[idx].windSpeed   = cur["wind_speed_10m"];
+  weather[idx].weatherCode = cur["weather_code"];
+  weather[idx].isDay       = (cur["is_day"] == 1);
+  weather[idx].valid       = true;
+
+  Serial.printf("[%s] %.1f C, %.0f%%, rain=%.1f, wind=%.0f, code=%d, day=%d\n",
+                L.name,
+                weather[idx].temperature,
+                weather[idx].humidity,
+                weather[idx].rain,
+                weather[idx].windSpeed,
+                weather[idx].weatherCode,
+                weather[idx].isDay);
+
+  return true;
+}
+
+void fetchAll() {
+  Serial.println("\n--- Fetching weather ---");
+  for (int i = 0; i < 3; i++) {
+    fetchWeather(i);
+    delay(300);
+  }
+  lastFetch = millis();
+  Serial.println("--- Done ---\n");
+}
+
+void handleButton() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    if (millis() - lastButton > DEBOUNCE) {
+      lastButton = millis();
+      currentCountry = (currentCountry + 1) % 3;
+      Serial.printf("-> %s\n", locations[currentCountry].name);
+      drawWeather(currentCountry);
+    }
+    // Debounce na kuzuia button holding
+    delay(150); 
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  u8g2.begin();
+  u8g2.setContrast(255);
+
+  showSplash();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting WiFi");
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi OK. IP: ");
+    Serial.println(WiFi.localIP());
+    fetchAll();
+  } else {
+    Serial.println("WiFi FAILED!");
+  }
+
+  drawWeather(currentCountry);
+}
+
+void loop() {
+  handleButton();
+
+  // Auto-refresh kila baada ya dakika 10
+  if (millis() - lastFetch > FETCH_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      fetchAll();
+      drawWeather(currentCountry);
+    }
+  }
+
+  // Mfumo wa kurudia kuunganisha WiFi ikikatika
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 15000UL) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+    }
+  }
+
+  delay(20);
+}
